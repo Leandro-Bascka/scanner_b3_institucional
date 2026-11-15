@@ -1,0 +1,7 @@
+yfinance>=0.2.50
+pandas
+numpy
+matplotlib
+requests
+lxml
+tzdata
