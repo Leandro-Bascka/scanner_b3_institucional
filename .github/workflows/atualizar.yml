@@ -1,0 +1,55 @@
+name: Atualizar scanner B3
+
+on:
+  schedule:
+    # Horários em UTC (Brasília = UTC-3, sem horário de verão).
+    # De hora em hora, das 10:05 às 17:05 de Brasília, de segunda a sexta:
+    - cron: "5 13-20 * * 1-5"
+    # Após o fechamento (18:35 de Brasília), com o candle do dia completo:
+    - cron: "35 21 * * 1-5"
+  workflow_dispatch:   # permite rodar manualmente pelo botão "Run workflow"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  construir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-site.txt
+
+      - name: Instalar dependências
+        run: pip install -r requirements-site.txt
+
+      - name: Rodar o scanner e gerar o site
+        run: python gerar_site.py site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  publicar:
+    needs: construir
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
