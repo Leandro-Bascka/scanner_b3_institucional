@@ -32,6 +32,7 @@ COLUNAS_SITE = [
     "SC_INST", "SC_REV", "SC_CONF", "VOL_REL", "RANK_FR",
     "ENTRADA", "STOP", "ALVO1", "ALVO2", "RISCO",
     "SR_POS", "SR_S1", "SR_S1F", "SR_R1", "SR_R1F", "SR_ESP", "SR_RR",
+    "VAL_CHECK", "VAL_PL", "VAL_PVP", "VAL_ROIC", "VAL_MB",
     "SMC_CONF", "SMC_ESTRUT", "SMC_ZONA",
     "SMC_T1", "SMC_T2", "SMC_T3", "SMC_UP", "SMC_STOP", "SMC_RR",
     "FALTA",
@@ -401,8 +402,10 @@ def montar_pagina(score, resultado, imagens, meta):
 {"".join(modelos)}
 </main>
 <footer>
-Leitura em candles diários (fonte: Yahoo Finance, universo: Fundamentus). Níveis e alvos são zonas de
+Leitura em candles diários (fonte: Yahoo Finance, universo e fundamentos: Fundamentus). Níveis e alvos são zonas de
 reação prováveis, não garantias, e nada aqui é recomendação de investimento. Dados podem ter atraso.
+Checklist de valor: P/L entre 0 e 20, P/VP entre 0 e 2, ROIC &gt; 10% e margem bruta &gt; 50% (4 critérios; P/FCF e PEG
+não estão disponíveis). "*" = algum critério sem dado no Fundamentus (comum em bancos); só informativo.
 </footer>
 <script>{JS}</script>
 </body>

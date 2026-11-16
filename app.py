@@ -64,6 +64,7 @@ COLUNAS_COMPACTAS = [
     "SC_INST", "SC_REV", "SC_CONF", "VOL_REL", "RANK_FR",
     "ENTRADA", "STOP", "ALVO1", "ALVO2",
     "SR_POS", "SR_S1", "SR_S1F", "SR_R1", "SR_R1F", "SR_ESP",
+    "VAL_CHECK",
     "SMC_CONF", "SMC_T1", "SMC_T2", "SMC_T3", "FALTA",
 ]
 

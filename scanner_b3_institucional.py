@@ -95,6 +95,16 @@ SR_QTD = 3                      # níveis listados de cada lado do preço
 SR_MEIA_VIDA = 120              # meia-vida (pregões) do peso de pivôs/reações
 SR_PROX_ATR = 0.75              # "no suporte/na resistência" = a até 0,75 ATR
 
+# Checklist de valor (só informativo; não altera score nem estado).
+# Usa os fundamentos que o próprio Fundamentus já devolve na consulta de
+# liquidez, sem nova fonte de dados. Faltam P/FCF e PEG: não existem ali.
+VAL_PL_MAX = 20                 # 0 < P/L < 20
+VAL_PVP_MAX = 2                 # 0 < P/VP < 2
+VAL_ROIC_MIN = 10               # ROIC > 10 %
+VAL_MB_MIN = 50                 # Margem bruta > 50 %
+FUNDAMENTOS = {}                # {papel: {PL, PVP, ROIC, MB}}, preenchido
+                                # por obter_acoes_mais_liquidas()
+
 URL_FUNDAMENTUS = "https://www.fundamentus.com.br/resultado.php"
 
 HEADERS = {
@@ -173,6 +183,98 @@ fila_resultados = queue.Queue()
 # IDENTIFICAÇÃO DINÂMICA DAS AÇÕES MAIS LÍQUIDAS
 # ============================================================
 
+def numero_fundamentus(valor):
+    """Converte '12,34%', '1.234,5' ou número já lido em float."""
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        return float(valor)
+
+    texto = (
+        str(valor).strip().replace("%", "")
+        .replace(".", "").replace(",", ".")
+    )
+
+    try:
+        return float(texto)
+    except ValueError:
+        return np.nan
+
+
+def extrair_fundamentos(tabela, coluna_papel):
+    """P/L, P/VP, ROIC e Margem Bruta de cada papel (se a tabela tiver)."""
+
+    def achar(nome):
+        for c in tabela.columns:
+            if str(c).strip().lower() == nome:
+                return c
+        return None
+
+    colunas = {
+        "PL": achar("p/l"), "PVP": achar("p/vp"),
+        "ROIC": achar("roic"), "MB": achar("mrg bruta"),
+    }
+
+    resultado = {}
+
+    try:
+        for _, linha in tabela.iterrows():
+
+            papel = str(linha[coluna_papel]).strip().upper()
+
+            resultado[papel] = {
+                chave: (
+                    numero_fundamentus(linha[col])
+                    if col is not None else np.nan
+                )
+                for chave, col in colunas.items()
+            }
+    except Exception:
+        return {}
+
+    return resultado
+
+
+def avaliar_valor(fundamentos):
+    """
+    Checklist de valor com os 4 critérios disponíveis. No Fundamentus
+    '0,00' significa sem dado (comum em Margem Bruta de bancos), então
+    esse critério não conta como atendido e o resultado ganha '*'.
+    """
+
+    vazio = {
+        "VAL_CHECK": "-", "VAL_PL": np.nan, "VAL_PVP": np.nan,
+        "VAL_ROIC": np.nan, "VAL_MB": np.nan,
+    }
+
+    if not fundamentos:
+        return vazio
+
+    def dado(v):
+        return v if (v is not None and np.isfinite(v) and v != 0) else np.nan
+
+    pl = dado(fundamentos.get("PL"))
+    pvp = dado(fundamentos.get("PVP"))
+    roic = dado(fundamentos.get("ROIC"))
+    mb = dado(fundamentos.get("MB"))
+
+    testes = [
+        np.isfinite(pl) and 0 < pl < VAL_PL_MAX,
+        np.isfinite(pvp) and 0 < pvp < VAL_PVP_MAX,
+        np.isfinite(roic) and roic > VAL_ROIC_MIN,
+        np.isfinite(mb) and mb > VAL_MB_MIN,
+    ]
+
+    faltou = any(not np.isfinite(v) for v in (pl, pvp, roic, mb))
+
+    if all(not np.isfinite(v) for v in (pl, pvp, roic, mb)):
+        return vazio
+
+    return {
+        "VAL_CHECK": f"{sum(testes)}/4" + ("*" if faltou else ""),
+        "VAL_PL": pl, "VAL_PVP": pvp, "VAL_ROIC": roic, "VAL_MB": mb,
+    }
+
+
 def obter_acoes_mais_liquidas():
 
     print("\nConsultando Fundamentus...")
@@ -217,6 +319,8 @@ def obter_acoes_mais_liquidas():
             c for c in tabela.columns if "liq.2meses" in str(c).lower()
         )
 
+        fundamentos = extrair_fundamentos(tabela, coluna_papel)
+
         tabela = tabela[[coluna_papel, coluna_liquidez]].copy()
         tabela.columns = ["PAPEL", "LIQUIDEZ"]
 
@@ -252,6 +356,9 @@ def obter_acoes_mais_liquidas():
             )
 
         ativos = tabela.head(N_ATIVOS)["PAPEL"].tolist()
+
+        FUNDAMENTOS.clear()
+        FUNDAMENTOS.update(fundamentos)
 
         print(f"{len(ativos)} ações selecionadas pela liquidez.")
 
@@ -1096,6 +1203,7 @@ def executar_analise(score_minimo, callback=None):
                 "SR_R1F": sr["R1"]["score"] if sr and sr["R1"] else np.nan,
                 "SR_ESP": sr["espaco_r1"] if sr else np.nan,
                 "SR_RR": sr["rr"] if sr else np.nan,
+                **avaliar_valor(FUNDAMENTOS.get(ativo)),
                 "SMC_CONF": f'{smc["confluencia"]}/5' if smc else "-",
                 "SMC_ESTRUT": smc["estrutura"] if smc else "-",
                 "SMC_LIQ": smc["liquidez"] if smc else "-",
@@ -2899,6 +3007,7 @@ COLUNAS = [
     "FR20", "RANK_FR", "DIST_EMA21",
     "ENTRADA", "STOP", "ALVO1", "ALVO2", "RISCO",
     "SR_POS", "SR_S1", "SR_S1F", "SR_R1", "SR_R1F", "SR_ESP", "SR_RR",
+    "VAL_CHECK", "VAL_PL", "VAL_PVP", "VAL_ROIC", "VAL_MB",
     "SMC_CONF", "SMC_ESTRUT", "SMC_LIQ", "SMC_ZONA",
     "SMC_T1", "SMC_T2", "SMC_T3", "SMC_UP", "SMC_STOP", "SMC_RR",
     "FALTA"
@@ -2919,6 +3028,8 @@ TITULOS = {
     "SMC_T1": "SMC ALVO 1", "SMC_T2": "SMC ALVO 2", "SMC_T3": "SMC ALVO 3",
     "SMC_UP": "SMC ALCANCE %", "SMC_STOP": "SMC STOP", "SMC_RR": "SMC R:R T1",
     "SR_POS": "PREÇO vs S/R",
+    "VAL_CHECK": "CHECKLIST VALOR", "VAL_PL": "P/L", "VAL_PVP": "P/VP",
+    "VAL_ROIC": "ROIC %", "VAL_MB": "MRG BRUTA %",
     "SR_S1": "SUPORTE 1", "SR_S1F": "FORÇA S1",
     "SR_R1": "RESISTÊNCIA 1", "SR_R1F": "FORÇA R1",
     "SR_ESP": "ESPAÇO ATÉ R1 %", "SR_RR": "R:R S/R",
@@ -2934,6 +3045,7 @@ CASAS = {
     "SMC_STOP": 2, "SMC_RR": 1,
     "SR_S1": 2, "SR_S1F": 0, "SR_R1": 2, "SR_R1F": 0,
     "SR_ESP": 1, "SR_RR": 1,
+    "VAL_PL": 1, "VAL_PVP": 2, "VAL_ROIC": 1, "VAL_MB": 1,
 }
 
 
