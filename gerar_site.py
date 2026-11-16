@@ -5,8 +5,8 @@ Gera o site estático do scanner (HTML) a partir da varredura da B3.
 Uso:  python gerar_site.py [pasta_de_saida]      (padrão: site)
 
 Cria duas páginas: index.html (score mínimo 70) e score85.html.
-Cada página traz a tabela ordenável, a leitura SMC e o gráfico de cada
-ativo com sinal. É executado de hora em hora pelo GitHub Actions.
+Cada página traz a tabela ordenável, os suportes/resistências, a leitura
+SMC e o gráfico de cada ativo com sinal. É executado de hora em hora pelo GitHub Actions.
 """
 
 import base64
@@ -31,10 +31,16 @@ COLUNAS_SITE = [
     "ATIVO", "PRECO", "ESTADO", "CLASSE", "DATA_1A", "IDADE",
     "SC_INST", "SC_REV", "SC_CONF", "VOL_REL", "RANK_FR",
     "ENTRADA", "STOP", "ALVO1", "ALVO2", "RISCO",
+    "SR_POS", "SR_S1", "SR_S1F", "SR_R1", "SR_R1F", "SR_ESP", "SR_RR",
     "SMC_CONF", "SMC_ESTRUT", "SMC_ZONA",
     "SMC_T1", "SMC_T2", "SMC_T3", "SMC_UP", "SMC_STOP", "SMC_RR",
     "FALTA",
 ]
+
+# colunas de texto (alinhadas à esquerda)
+COLUNAS_TEXTO = (
+    "ESTADO", "CLASSE", "FALTA", "SR_POS", "SMC_ESTRUT", "SMC_ZONA"
+)
 
 ESTADOS = [
     "REVERSÃO CONFIRMADA", "CONTINUAÇÃO", "REVERSÃO INICIAL",
@@ -92,13 +98,13 @@ def preparar_coleta():
 # GRÁFICOS
 # ============================================================
 
-def gerar_imagem(graficos, linhas, smc, ativo):
+def gerar_imagem(graficos, linhas, smc, niveis, ativo):
 
     figura = Figure(figsize=(14, 9), dpi=72)
 
     sc.desenhar_grafico(
         figura, graficos[ativo], linhas[ativo], "escuro",
-        PERIODO_GRAFICO, smc.get(ativo)
+        PERIODO_GRAFICO, smc.get(ativo), niveis.get(ativo)
     )
 
     memoria = io.BytesIO()
@@ -237,7 +243,7 @@ def valor_ordenacao(coluna, valor):
 
 def montar_pagina(score, resultado, imagens, meta):
 
-    tabela, graficos, erros, tempo, smc = resultado
+    tabela, graficos, erros, tempo, smc, niveis = resultado
 
     esc = html.escape
 
@@ -256,7 +262,7 @@ def montar_pagina(score, resultado, imagens, meta):
     )
 
     cabecalho = "".join(
-        f'<th class="{"l" if c in ("ESTADO", "CLASSE", "FALTA", "SMC_ESTRUT", "SMC_ZONA") else ""}">'
+        f'<th class="{"l" if c in COLUNAS_TEXTO else ""}">'
         f'{esc(sc.TITULOS[c])}</th>'
         for c in COLUNAS_SITE
     )
@@ -282,9 +288,7 @@ def montar_pagina(score, resultado, imagens, meta):
                 if coluna in sc.CASAS else str(bruto)
             )
 
-            esq = ' class="l"' if coluna in (
-                "ESTADO", "CLASSE", "FALTA", "SMC_ESTRUT", "SMC_ZONA"
-            ) else ""
+            esq = ' class="l"' if coluna in COLUNAS_TEXTO else ""
 
             celulas.append(
                 f'<td{esq} data-v="{esc(valor_ordenacao(coluna, bruto))}">'
@@ -297,9 +301,26 @@ def montar_pagina(score, resultado, imagens, meta):
             + "".join(celulas) + "</tr>"
         )
 
-        if ativo in imagens or ativo in smc:
+        if ativo in imagens or ativo in smc or ativo in niveis:
 
             partes = [f"<h3>{esc(ativo)} — {esc(estado)}</h3>"]
+
+            if ativo in niveis:
+                sr_linhas = niveis[ativo]["linhas"]
+                partes.append(
+                    "<h4>Suportes e resistências</h4>"
+                    f'<p class="meta">{esc(sr_linhas[0])}</p><ul>'
+                    + "".join(
+                        f'<li style="margin-left:{18 if t.startswith("  ") else 0}px;'
+                        f'list-style:{"circle" if t.startswith("  ") else "disc"}">'
+                        f"{esc(t.strip())}</li>"
+                        for t in sr_linhas[1:-1]
+                    )
+                    + f'</ul><p class="meta">{esc(sr_linhas[-1])}</p>'
+                )
+
+            if ativo in smc:
+                partes.append("<h4>Leitura SMC</h4>")
 
             if ativo in smc:
                 partes.append(
@@ -409,7 +430,7 @@ def main(saida="site"):
             score, callback=lambda *args: None
         )
 
-        tabela, graficos, erros, tempo, smc = resultado
+        tabela, graficos, erros, tempo, smc, niveis = resultado
 
         linhas = tabela.set_index("ATIVO", drop=False).to_dict("index")
 
@@ -418,7 +439,7 @@ def main(saida="site"):
         com_sinal = tabela[tabela["ESTADO"] != "SEM SINAL"]["ATIVO"].tolist()
 
         for ativo in com_sinal[:MAX_GRAFICOS]:
-            imagens[ativo] = gerar_imagem(graficos, linhas, smc, ativo)
+            imagens[ativo] = gerar_imagem(graficos, linhas, smc, niveis, ativo)
 
         agora = sc.agora_brasil()
 

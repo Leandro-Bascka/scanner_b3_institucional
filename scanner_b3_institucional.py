@@ -87,6 +87,14 @@ SMC_K = 3                       # pivôs: 3 candles de cada lado
 SMC_RECUO = 150                 # pregões analisados para zonas e níveis
 SMC_ALCANCE_ATR = 10            # alvos até 10 ATRs acima do preço
 
+# Suportes e resistências (histórico + volume por preço + SMC)
+SR_RECUO = 250                  # pregões de histórico analisados
+SR_ALCANCE_ATR = 12             # só níveis até 12 ATRs do preço
+SR_SCORE_MIN = 50               # força mínima (0-100) para listar um nível
+SR_QTD = 3                      # níveis listados de cada lado do preço
+SR_MEIA_VIDA = 120              # meia-vida (pregões) do peso de pivôs/reações
+SR_PROX_ATR = 0.75              # "no suporte/na resistência" = a até 0,75 ATR
+
 URL_FUNDAMENTUS = "https://www.fundamentus.com.br/resultado.php"
 
 HEADERS = {
@@ -974,6 +982,7 @@ def executar_analise(score_minimo, callback=None):
     resultados = []
     graficos = {}
     smc_map = {}
+    niveis_map = {}
     erros = []
 
     total = len(ativos)
@@ -1025,11 +1034,21 @@ def executar_analise(score_minimo, callback=None):
                 else:
                     entrada = stop = np.nan
 
+            sr = None
+
+            try:
+                sr = analisar_niveis(df)
+            except Exception as erro_sr:
+                print(f"Suportes/resistências falharam em {ativo}: {erro_sr}")
+
+            if sr is not None:
+                niveis_map[ativo] = sr
+
             smc = None
 
             if estado in SMC_ESTADOS:
                 try:
-                    smc = analisar_smc(df)
+                    smc = analisar_smc(df, sr)
                 except Exception as erro_smc:
                     print(f"SMC falhou em {ativo}: {erro_smc}")
 
@@ -1070,6 +1089,13 @@ def executar_analise(score_minimo, callback=None):
                 "ALVO1": alvo1,
                 "ALVO2": alvo2,
                 "RISCO": risco_pct,
+                "SR_POS": sr["posicao"] if sr else "-",
+                "SR_S1": sr["S1"]["nivel"] if sr and sr["S1"] else np.nan,
+                "SR_S1F": sr["S1"]["score"] if sr and sr["S1"] else np.nan,
+                "SR_R1": sr["R1"]["nivel"] if sr and sr["R1"] else np.nan,
+                "SR_R1F": sr["R1"]["score"] if sr and sr["R1"] else np.nan,
+                "SR_ESP": sr["espaco_r1"] if sr else np.nan,
+                "SR_RR": sr["rr"] if sr else np.nan,
                 "SMC_CONF": f'{smc["confluencia"]}/5' if smc else "-",
                 "SMC_ESTRUT": smc["estrutura"] if smc else "-",
                 "SMC_LIQ": smc["liquidez"] if smc else "-",
@@ -1116,10 +1142,11 @@ def executar_analise(score_minimo, callback=None):
 
     if callback is None:
         fila_resultados.put(
-            ("finalizado", tabela, graficos, erros, tempo, smc_map)
+            ("finalizado", tabela, graficos, erros, tempo, smc_map,
+             niveis_map)
         )
 
-    return tabela, graficos, erros, tempo, smc_map
+    return tabela, graficos, erros, tempo, smc_map, niveis_map
 
 
 # ============================================================
@@ -1387,7 +1414,7 @@ def agrupar_alvos(candidatos, tolerancia):
     return saida
 
 
-def analisar_smc(df):
+def analisar_smc(df, sr=None):
     """
     Lê estrutura, liquidez, desequilíbrios e zonas de oferta/demanda e
     projeta onde o preço tende a encontrar liquidez acima.
@@ -1560,6 +1587,15 @@ def analisar_smc(df):
                 "tag": "Proj 1:1", "peso": 1,
             })
 
+    # ---- Resistências históricas (força >= 55) também são candidatas a alvo
+    if sr:
+        for r in sr["resistencias"]:
+            if r["score"] >= 55:
+                candidatos.append({
+                    "preco": r["lo"], "tag": "Res.hist.",
+                    "peso": 3 if r["score"] >= 70 else 2,
+                })
+
     candidatos = [
         x for x in candidatos
         if preco * 1.005 <= x["preco"] <= preco + SMC_ALCANCE_ATR * atr_u
@@ -1731,6 +1767,776 @@ def analisar_smc(df):
     }
 
 
+# ------------------------------------------------------------
+# SUPORTES E RESISTÊNCIAS (histórico + volume por preço + SMC)
+# ------------------------------------------------------------
+
+SMC_PTS = {
+    "OB": 12, "OBt": 8, "FVG": 8, "Gap": 9,
+    "EQH": 10, "EQL": 10, "BSL": 4, "SSL": 4,
+    "BOS": 7, "CHoCH": 8,
+}
+
+
+def peso_idade(idade, meia_vida=SR_MEIA_VIDA):
+    """Peso que decai com a idade (meia-vida em pregões); mínimo 0,25."""
+    return max(0.25, 0.5 ** (max(idade, 0) / meia_vida))
+
+
+def passo_redondo(preco):
+    """Espaçamento dos números redondos (níveis psicológicos)."""
+
+    if preco < 5:
+        return 0.5
+    if preco < 20:
+        return 1.0
+    if preco < 50:
+        return 5.0
+    if preco < 200:
+        return 10.0
+    return 50.0
+
+
+def classe_nivel(score):
+
+    if score >= 70:
+        return "FORTE"
+    if score >= 55:
+        return "MÉDIO"
+    return "FRACO"
+
+
+def perfil_volume(h, l, v, n_bins=60):
+    """
+    Volume por faixa de preço: o volume de cada candle é distribuído de
+    forma uniforme entre a mínima e a máxima. Devolve (bordas, densidade
+    relativa à média) ou None.
+    """
+
+    baixo, alto = float(np.nanmin(l)), float(np.nanmax(h))
+
+    if not alto > baixo:
+        return None
+
+    bordas = np.linspace(baixo, alto, n_bins + 1)
+    vol = np.zeros(n_bins)
+
+    ia = np.clip(np.searchsorted(bordas, l, side="right") - 1, 0, n_bins - 1)
+    ib = np.clip(np.searchsorted(bordas, h, side="right") - 1, 0, n_bins - 1)
+
+    for a, b, vv in zip(ia, ib, v):
+        b = max(a, b)
+        vol[a:b + 1] += vv / (b - a + 1)
+
+    suave = np.convolve(vol, [0.25, 0.5, 0.25], mode="same")
+    media = suave.mean()
+
+    if not media > 0:
+        return None
+
+    return bordas, suave / media
+
+
+def densidade_zona(perfil, lo, hi):
+    """Densidade de volume média (1,0 = média do período) na zona."""
+
+    if perfil is None:
+        return 1.0
+
+    bordas, dens = perfil
+    passo = bordas[1] - bordas[0]
+    centros = (bordas[:-1] + bordas[1:]) / 2
+
+    dentro = (centros + passo / 2 >= lo) & (centros - passo / 2 <= hi)
+
+    return float(dens[dentro].mean()) if dentro.any() else 0.0
+
+
+def nos_de_volume(perfil, area=0.70):
+    """POC, limites da área de valor (VAL/VAH) e nós de alto volume (HVN)."""
+
+    bordas, dens = perfil
+    centros = (bordas[:-1] + bordas[1:]) / 2
+
+    poc = int(np.argmax(dens))
+    total = dens.sum()
+    a = b = poc
+    soma = dens[poc]
+
+    while soma < area * total and (a > 0 or b < len(dens) - 1):
+
+        esq = dens[a - 1] if a > 0 else -1.0
+        dir_ = dens[b + 1] if b < len(dens) - 1 else -1.0
+
+        if esq >= dir_:
+            a -= 1
+            soma += dens[a]
+        else:
+            b += 1
+            soma += dens[b]
+
+    nos = [
+        (float(centros[poc]), "POC"),
+        (float(bordas[a]), "VAL"),
+        (float(bordas[b + 1]), "VAH"),
+    ]
+
+    for i in range(1, len(dens) - 1):
+        if (
+            dens[i] >= 1.3
+            and dens[i] > dens[i - 1]
+            and dens[i] >= dens[i + 1]
+            and abs(i - poc) > 2
+        ):
+            nos.append((float(centros[i]), "HVN"))
+
+    return nos
+
+
+def agrupar_niveis(cands, tol, largura_max):
+    """Une candidatos próximos em zonas (largura limitada)."""
+
+    cands = sorted(cands, key=lambda x: (x["lo"] + x["hi"]) / 2)
+    grupos = []
+
+    for c in cands:
+
+        larg = c["hi"] - c["lo"]
+
+        if grupos:
+
+            g = grupos[-1]
+            novo_lo = min(g["lo"], c["lo"])
+            novo_hi = max(g["hi"], c["hi"])
+            limite = max(largura_max, g["larg_max"], larg)
+
+            if c["lo"] - g["hi"] <= tol and novo_hi - novo_lo <= limite:
+                g["itens"].append(c)
+                g["lo"], g["hi"] = novo_lo, novo_hi
+                g["larg_max"] = max(g["larg_max"], larg)
+                continue
+
+        grupos.append({
+            "lo": c["lo"], "hi": c["hi"], "larg_max": larg, "itens": [c]
+        })
+
+    return grupos
+
+
+def medir_reacoes(h, l, c, atr, lo, hi, ini):
+    """
+    Testes históricos da zona [lo, hi]. Cada vez que o preço entra na
+    zona (com folga de 0,25 ATR) conta um teste:
+      - reagiu: afastou-se pelo menos 1 ATR da zona em até 5 pregões,
+        sem fechar além dela por mais de 0,3 ATR;
+      - quebrou: fechou além da zona por mais de 0,3 ATR.
+    Testes mais recentes pesam mais.
+    Devolve (R ponderado, B ponderado, testes, reações, quebras, índice
+    do último teste).
+    """
+
+    n = len(c)
+    pad = 0.25 * atr
+    dentro = (h >= lo - pad) & (l <= hi + pad)
+
+    R = B = 0.0
+    testes = reacoes = quebras = 0
+    ultimo = None
+
+    t = max(ini, 1)
+
+    while t < n - 1:
+
+        if not dentro[t] or dentro[t - 1]:
+            t += 1
+            continue
+
+        t0 = e = t
+
+        while e + 1 < n and dentro[e + 1]:
+            e += 1
+
+        t = e + 1
+        a = atr[t0]
+
+        # episódio em curso ou sem pregões suficientes depois dele
+        if e > n - 3 or not np.isfinite(a):
+            continue
+
+        fim = min(n - 1, e + 5)
+
+        if c[t0 - 1] > hi:      # veio de cima: teste de suporte
+            quebrou = bool((c[t0:fim + 1] < lo - 0.3 * a).any())
+            reagiu = (not quebrou) and h[e + 1:fim + 1].max() >= hi + a
+        else:                   # veio de baixo: teste de resistência
+            quebrou = bool((c[t0:fim + 1] > hi + 0.3 * a).any())
+            reagiu = (not quebrou) and l[e + 1:fim + 1].min() <= lo - a
+
+        peso = peso_idade(n - 1 - t0)
+        testes += 1
+        ultimo = t0
+
+        if reagiu:
+            R += peso
+            reacoes += 1
+        elif quebrou:
+            B += peso
+            quebras += 1
+
+    return R, B, testes, reacoes, quebras, ultimo
+
+
+def analisar_niveis(df):
+    """
+    Suportes e resistências por confluência de:
+      - histórico: pivôs (toques) e reações medidas no próprio preço;
+      - volume por preço: POC, área de valor e nós de alto volume;
+      - SMC: order blocks, FVG/gaps, EQH/EQL, liquidez e BOS/CHoCH;
+      - extras: EMA 50/200, VWAP ancorada, máx/mín de 52 semanas e
+        números redondos.
+    Cada zona recebe uma força de 0 a 100: pivôs 25 + reações medidas 25
+    + volume 15 + SMC 25 + confluências 10. Usa só dados até o último
+    candle (pivôs só valem depois de confirmados).
+    """
+
+    o = df["Open"].to_numpy(dtype=float)
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    c = df["Close"].to_numpy(dtype=float)
+    v = np.nan_to_num(df["Volume"].to_numpy(dtype=float))
+    atr = df["ATR"].to_numpy(dtype=float)
+
+    n = len(df)
+    preco = float(c[-1])
+    atr_u = float(atr[-1])
+
+    if n < 120 or not np.isfinite(atr_u) or atr_u <= 0:
+        return None
+
+    datas = df.index
+    ini = max(1, n - SR_RECUO)
+    alcance = SR_ALCANCE_ATR * atr_u
+    tol_eq = max(0.25 * atr_u, 0.0015 * preco)
+
+    cands = []
+
+    def add(lo, hi, cat, tag, w=0.0, pts=0.0, idx=None):
+        if np.isfinite(lo) and np.isfinite(hi) and hi >= lo:
+            cands.append({
+                "lo": float(lo), "hi": float(hi), "cat": cat,
+                "tag": tag, "w": w, "pts": pts, "idx": idx,
+            })
+
+    # ---- Pivôs menores (k=3) e maiores (k=8): toques históricos
+    altas3, baixas3 = detectar_pivos(h, l, SMC_K)
+    altas8, baixas8 = detectar_pivos(h, l, 8)
+
+    for altas, baixas, peso in (
+        (altas3, baixas3, 1.0), (altas8, baixas8, 2.0)
+    ):
+        for i in altas:
+            if i >= ini:
+                add(h[i], h[i], "pivo", "pivô",
+                    w=peso * peso_idade(n - 1 - i), idx=i)
+        for i in baixas:
+            if i >= ini:
+                add(l[i], l[i], "pivo", "pivô",
+                    w=peso * peso_idade(n - 1 - i), idx=i)
+
+    # ---- SMC: estrutura, order blocks, FVG/gaps, liquidez
+    eventos, _ = mapear_estrutura(h, l, c, altas3, baixas3, SMC_K)
+    zonas = detectar_desequilibrios(h, l, atr, ini)
+    obs = detectar_order_blocks(
+        o, h, l, c, eventos, altas3, baixas3, SMC_K, ini
+    )
+
+    for b in obs:
+        add(b["base"], b["topo"], "smc",
+            "OB↑" if b["tipo"] == "alta" else "OB↓",
+            pts=SMC_PTS["OBt"] if b["tocado"] else SMC_PTS["OB"])
+
+    for z in zonas:
+        rotulo = "Gap" if z["gap"] else "FVG"
+        add(z["base"], z["topo"], "smc",
+            rotulo + ("↑" if z["tipo"] == "alta" else "↓"),
+            pts=SMC_PTS[rotulo])
+
+    for e in eventos:
+        if e["t"] >= ini:
+            add(e["nivel"], e["nivel"], "smc",
+                e["tipo"] + ("↑" if e["dir"] == "alta" else "↓"),
+                pts=SMC_PTS[e["tipo"]])
+
+    def grupos_iguais(indices, serie):
+        ordenados = sorted(indices, key=lambda i: serie[i])
+        grupos, atual = [], []
+        for i in ordenados:
+            if atual and serie[i] - serie[atual[-1]] > tol_eq:
+                grupos.append(atual)
+                atual = []
+            atual.append(i)
+        if atual:
+            grupos.append(atual)
+        return grupos
+
+    for tag_eq, tag_li, indices, serie, topos in (
+        ("EQH", "BSL", [i for i in altas3 if i >= ini], h, True),
+        ("EQL", "SSL", [i for i in baixas3 if i >= ini], l, False),
+    ):
+        for g in grupos_iguais(indices, serie):
+
+            precos = [float(serie[i]) for i in g]
+            ultimo = max(g)
+
+            if ultimo + 1 < n:
+                varrido = (
+                    h[ultimo + 1:].max() > max(precos) + 0.1 * atr_u
+                    if topos else
+                    l[ultimo + 1:].min() < min(precos) - 0.1 * atr_u
+                )
+            else:
+                varrido = False
+
+            if len(g) >= 2:
+                add(min(precos), max(precos), "smc", tag_eq,
+                    pts=SMC_PTS[tag_eq] * (0.6 if varrido else 1.0))
+            elif not varrido:
+                add(precos[0], precos[0], "smc", tag_li,
+                    pts=SMC_PTS[tag_li])
+
+    # ---- Volume por preço
+    perfil = perfil_volume(h[ini:], l[ini:], v[ini:])
+
+    if perfil is not None:
+        for centro, rotulo in nos_de_volume(perfil):
+            add(centro, centro, "vol", rotulo)
+
+    # ---- Confluências extras (só reforçam zonas existentes)
+    extras = [
+        (float(df["EMA200"].iloc[-1]), "EMA200", 4),
+        (float(df["EMA50"].iloc[-1]), "EMA50", 2),
+        (float(h[-252:].max()), "Máx 52s", 3),
+        (float(l[-252:].min()), "Mín 52s", 3),
+    ]
+
+    for coluna in ("VWAP_FUNDO", "VWAP_ROMP"):
+        if coluna in df.columns and np.isfinite(df[coluna].iloc[-1]):
+            extras.append((float(df[coluna].iloc[-1]), "VWAP anc.", 2))
+
+    passo = passo_redondo(preco)
+    redondo = np.floor((preco - alcance) / passo) * passo
+
+    while redondo <= preco + alcance:
+        if redondo > 0:
+            extras.append((float(redondo), "Redondo", 2))
+        redondo += passo
+
+    # ---- Agrupamento e pontuação
+    grupos = agrupar_niveis(cands, 0.5 * atr_u, 1.5 * atr_u)
+
+    niveis = []
+
+    for g in grupos:
+
+        lo, hi = g["lo"], g["hi"]
+
+        if hi < preco - alcance or lo > preco + alcance:
+            continue
+
+        itens = g["itens"]
+
+        conf = {}
+        for valor, tag, pts in extras:
+            if lo - 0.3 * atr_u <= valor <= hi + 0.3 * atr_u:
+                conf[tag] = max(conf.get(tag, 0), pts)
+
+        pivos = [i for i in itens if i["cat"] == "pivo"]
+        toques = len({i["idx"] for i in pivos})
+        T = sum(i["w"] for i in pivos)
+
+        R, B, testes, reacoes, quebras, ult = medir_reacoes(
+            h, l, c, atr, lo, hi, ini
+        )
+
+        smc_pts = {}
+        for i in itens:
+            if i["cat"] == "smc":
+                smc_pts[i["tag"]] = max(smc_pts.get(i["tag"], 0), i["pts"])
+
+        dens = densidade_zona(perfil, lo, hi)
+
+        partes = {
+            "pivos": 25 * (1 - np.exp(-T / 2.2)),
+            "reacoes": (
+                25 * (1 - np.exp(-R / 1.6)) * (R + 0.5) / (R + B + 1)
+            ),
+            "volume": 15 * min(1.0, max(0.0, (dens - 1.0) / 1.2)),
+            "smc": min(25.0, sum(smc_pts.values())),
+            "confluencia": min(10.0, sum(conf.values())),
+        }
+
+        score = int(round(min(100.0, sum(partes.values()))))
+
+        fontes = []
+
+        for cat in ("smc", "vol"):
+            for i in itens:
+                if i["cat"] == cat and i["tag"] not in fontes:
+                    fontes.append(i["tag"])
+
+        if toques:
+            fontes.append(f'{toques} pivô{"s" if toques > 1 else ""}')
+
+        fontes += [t for t in conf if t not in fontes]
+
+        niveis.append({
+            "lo": float(lo), "hi": float(hi),
+            "score": score, "classe": classe_nivel(score),
+            "fontes": fontes,
+            "toques": toques, "testes": testes,
+            "reacoes": reacoes, "quebras": quebras,
+            "ultimo": (
+                datas[ult].strftime("%d/%m/%y") if ult is not None else "-"
+            ),
+            "partes": {k: round(float(x), 1) for k, x in partes.items()},
+            "chave": False,
+        })
+
+    validos = [x for x in niveis if x["score"] >= SR_SCORE_MIN]
+
+    dentro = [x for x in validos if x["lo"] <= preco <= x["hi"]]
+    dentro = max(dentro, key=lambda x: x["score"]) if dentro else None
+
+    def escolher(lista, distancia):
+
+        escolhidos = []
+
+        for x in sorted(lista, key=distancia):
+            if (
+                escolhidos
+                and distancia(x) - distancia(escolhidos[-1]) < 0.6 * atr_u
+            ):
+                if x["score"] > escolhidos[-1]["score"]:
+                    escolhidos[-1] = x
+                continue
+            escolhidos.append(x)
+
+        escolhidos = escolhidos[:SR_QTD]
+
+        if escolhidos:
+            max(escolhidos, key=lambda x: x["score"])["chave"] = True
+
+        return escolhidos
+
+    suportes = escolher(
+        [x for x in validos if x["hi"] < preco], lambda x: preco - x["hi"]
+    )
+    resistencias = escolher(
+        [x for x in validos if x["lo"] > preco], lambda x: x["lo"] - preco
+    )
+
+    for x in suportes:
+        x["lado"] = "S"
+        x["nivel"] = x["hi"]
+        x["dist_pct"] = (x["hi"] / preco - 1) * 100
+        x["dist_atr"] = (preco - x["hi"]) / atr_u
+
+    for x in resistencias:
+        x["lado"] = "R"
+        x["nivel"] = x["lo"]
+        x["dist_pct"] = (x["lo"] / preco - 1) * 100
+        x["dist_atr"] = (x["lo"] - preco) / atr_u
+
+    s1 = suportes[0] if suportes else None
+    r1 = resistencias[0] if resistencias else None
+
+    espaco_r1 = r1["dist_pct"] if r1 else np.nan
+    stop_sr = (s1["lo"] - 0.2 * atr_u) if s1 else np.nan
+    risco = (preco - stop_sr) if s1 else np.nan
+
+    rr = (
+        (r1["lo"] - preco) / risco
+        if r1 and s1 and risco > 0 else np.nan
+    )
+
+    # ---- Onde o preço está em relação aos níveis
+    # (a pergunta que abre qualquer decisão: "preço no suporte? na
+    # resistência? ou no meio do caminho?")
+    candidatos_pos = []
+
+    if dentro is not None:
+        origem = float(c[max(0, len(c) - 6)])
+        meio = (dentro["lo"] + dentro["hi"]) / 2
+
+        if origem >= dentro["hi"]:
+            papel = "NO SUPORTE"          # veio de cima: testa como suporte
+        elif origem <= dentro["lo"]:
+            papel = "NA RESISTÊNCIA"      # veio de baixo: testa como resistência
+        else:
+            papel = "NO SUPORTE" if preco >= meio else "NA RESISTÊNCIA"
+
+        candidatos_pos.append((0.0, papel))
+
+    if s1:
+        candidatos_pos.append(((preco - s1["hi"]) / atr_u, "NO SUPORTE"))
+
+    if r1:
+        candidatos_pos.append(((r1["lo"] - preco) / atr_u, "NA RESISTÊNCIA"))
+
+    candidatos_pos = [x for x in candidatos_pos if x[0] <= SR_PROX_ATR]
+
+    if candidatos_pos:
+        posicao = min(candidatos_pos, key=lambda x: x[0])[1]
+    elif s1 or r1:
+        posicao = "ENTRE NÍVEIS"
+    else:
+        posicao = "SEM NÍVEL"
+
+    # ---- Texto
+    def pct(valor):
+        return f"{valor:+.1f}".replace(".", ",") + "%"
+
+    def zona_txt(x):
+        if x["hi"] - x["lo"] < 0.005:
+            return br(x["lo"])
+        return f'{br(x["lo"])}–{br(x["hi"])}'
+
+    def linha_nivel(rotulo, x):
+        reacao = (
+            f'reagiu em {x["reacoes"]} de {x["testes"]} testes'
+            if x["testes"] else "sem testes no período"
+        )
+        return (
+            f'  {rotulo}{"★" if x["chave"] else ""} {zona_txt(x)} · '
+            f'força {x["score"]} ({x["classe"]}) · {pct(x["dist_pct"])} '
+            f'({br(x["dist_atr"], 1)} ATR) · {reacao} · '
+            + " + ".join(x["fontes"][:5])
+        )
+
+    linhas = [
+        f"Suportes e resistências (histórico + volume + SMC) | "
+        f"preço {br(preco)} | ATR {br(atr_u)}"
+    ]
+
+    linhas.append(
+        f"Posição do preço: {posicao} (considera até "
+        f"{br(SR_PROX_ATR, 2)} ATR de distância de uma zona)."
+    )
+
+    if dentro is not None:
+        linhas.append(
+            f'Preço dentro da zona {zona_txt(dentro)} (força '
+            f'{dentro["score"]}, {dentro["classe"]}): teste em andamento.'
+        )
+
+    linhas.append("Resistências (acima, da mais próxima à mais distante):")
+
+    linhas += (
+        [linha_nivel(f"R{i}", x) for i, x in enumerate(resistencias, 1)]
+        or [f"  nenhuma zona com força ≥ {SR_SCORE_MIN} em "
+            f"{SR_ALCANCE_ATR} ATRs"]
+    )
+
+    linhas.append("Suportes (abaixo, do mais próximo ao mais distante):")
+
+    linhas += (
+        [linha_nivel(f"S{i}", x) for i, x in enumerate(suportes, 1)]
+        or [f"  nenhuma zona com força ≥ {SR_SCORE_MIN} em "
+            f"{SR_ALCANCE_ATR} ATRs"]
+    )
+
+    if r1 and s1:
+        linhas.append(
+            f"Espaço até R1: {pct(espaco_r1)} · risco até abaixo de S1 "
+            f"({br(stop_sr)}): {br(risco / preco * 100, 1)}% · R:R "
+            f"{br(rr, 1)}"
+        )
+
+    linhas.append(
+        "Força 0–100 = pivôs/toques 25 + reações medidas 25 + volume por "
+        "preço 15 + SMC 25 + confluências 10. ★ = mais forte do lado."
+    )
+
+    return {
+        "preco": preco,
+        "atr": atr_u,
+        "suportes": suportes,
+        "resistencias": resistencias,
+        "dentro": dentro,
+        "posicao": posicao,
+        "todos": validos,
+        "S1": s1,
+        "R1": r1,
+        "espaco_r1": espaco_r1,
+        "stop_sr": stop_sr,
+        "rr": rr,
+        "linhas": linhas,
+    }
+
+
+def desenhar_niveis(ax, sr, n, t, ylim=None):
+    """
+    Zonas de suporte (verde) e resistência (vermelho) no gráfico.
+
+    Feito para funcionar com zoom e arraste (estilo TradingView): as
+    zonas e linhas atravessam toda a largura visível, e os rótulos ficam
+    presos à borda esquerda da janela (x em coordenadas do eixo, y em
+    preço), então continuam à vista ao ampliar ou deslocar o gráfico.
+    Níveis fora da faixa vertical atual são desenhados mesmo assim (e
+    cortados pela moldura), para aparecerem quando o usuário rolar.
+    """
+
+    atr = sr["atr"]
+    ancora = ax.get_yaxis_transform()   # x: fração do eixo | y: preço
+
+    for lado, lista, cor in (
+        ("S", sr["suportes"], t["alta"]),
+        ("R", sr["resistencias"], t["baixa"]),
+    ):
+        for i, x in enumerate(lista, start=1):
+
+            ax.axhspan(
+                x["lo"] - 0.08 * atr, x["hi"] + 0.08 * atr,
+                color=cor, alpha=0.07 + 0.12 * x["score"] / 100,
+                linewidth=0, zorder=0
+            )
+            ax.axhline(
+                x["nivel"], color=cor, linestyle=(0, (6, 3)),
+                linewidth=1.4 if x["score"] >= 70 else 0.9,
+                alpha=0.9, zorder=2
+            )
+            ax.text(
+                0.006, x["nivel"],
+                f'{lado}{i}{"★" if x["chave"] else ""} '
+                f'{br(x["nivel"])} · {x["score"]}',
+                transform=ancora, clip_on=True,
+                color=cor, fontsize=7.5, ha="left",
+                va="bottom" if lado == "R" else "top",
+                fontweight="bold", zorder=6,
+                bbox=dict(
+                    boxstyle="round,pad=0.15", fc=t["painel"],
+                    ec="none", alpha=0.75
+                )
+            )
+
+
+def validar_niveis(df, passo=10, horizonte=10, minimo=260, semente=0):
+    """
+    Teste walk-forward dos níveis: em cada data (passo em passo) calcula
+    os níveis só com dados até ali e observa os próximos 'horizonte'
+    pregões. No primeiro toque, "reagiu" = afastou-se 1 ATR em até 5
+    pregões sem fechar além da zona por 0,3 ATR; "quebrou" = fechou além.
+    Compara FORTE/MÉDIO/FRACO com níveis de CONTROLE sorteados à mesma
+    distância. Se os fortes não reagirem mais que o controle, os pesos
+    do score não têm valor preditivo.
+    """
+
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    c = df["Close"].to_numpy(dtype=float)
+    atr = df["ATR"].to_numpy(dtype=float)
+
+    n = len(df)
+    rng = np.random.default_rng(semente)
+
+    estat = {
+        g: {"niveis": 0, "tocou": 0, "reagiu": 0, "quebrou": 0}
+        for g in ("FORTE", "MÉDIO", "FRACO", "CONTROLE")
+    }
+
+    def avaliar(lo, hi, lado, t):
+
+        a = atr[t]
+        fim = min(n - 1, t + horizonte)
+
+        for j in range(t + 1, fim + 1):
+
+            if (lado == "R" and h[j] >= lo) or (lado == "S" and l[j] <= hi):
+
+                f2 = min(n - 1, j + 5)
+
+                if lado == "R":
+                    quebrou = bool((c[j:f2 + 1] > hi + 0.3 * a).any())
+                    reagiu = (not quebrou) and l[j + 1:f2 + 1].min() <= lo - a
+                else:
+                    quebrou = bool((c[j:f2 + 1] < lo - 0.3 * a).any())
+                    reagiu = (not quebrou) and h[j + 1:f2 + 1].max() >= hi + a
+
+                return "reagiu" if reagiu else (
+                    "quebrou" if quebrou else "neutro"
+                )
+
+        return None
+
+    def registrar(grupo, resultado):
+        e = estat[grupo]
+        e["niveis"] += 1
+        if resultado is not None:
+            e["tocou"] += 1
+            if resultado in ("reagiu", "quebrou"):
+                e[resultado] += 1
+
+    for t in range(minimo, n - horizonte - 6, passo):
+
+        sr = analisar_niveis(df.iloc[:t + 1])
+
+        if sr is None:
+            continue
+
+        for lado, lista in (
+            ("S", sr["suportes"]), ("R", sr["resistencias"])
+        ):
+            for x in lista:
+                registrar(x["classe"], avaliar(x["lo"], x["hi"], lado, t))
+
+        a = atr[t]
+
+        # Controle: mesma largura de zona dos níveis reais (zonas largas
+        # são mais difíceis de "quebrar", e isso não pode favorecer o
+        # score) e distância sorteada entre 0,5 e 8 ATRs.
+        larguras = [x["hi"] - x["lo"] for x in sr["todos"]] or [0.4 * a]
+
+        for lado in ("S", "R"):
+            for _ in range(3):
+                dist = rng.uniform(0.5, 8.0) * a
+                larg = float(rng.choice(larguras))
+                centro = c[t] - dist if lado == "S" else c[t] + dist
+                registrar(
+                    "CONTROLE",
+                    avaliar(centro - larg / 2, centro + larg / 2, lado, t)
+                )
+
+    return estat
+
+
+def resumir_validacao(estat):
+    """Linhas de texto com as taxas de cada grupo."""
+
+    linhas = [
+        f'{"grupo":<10}{"níveis":>8}{"tocados":>9}'
+        f'{"% reação (±95%)":>20}{"% quebra":>11}'
+    ]
+
+    for g in ("FORTE", "MÉDIO", "FRACO", "CONTROLE"):
+
+        e = estat[g]
+        toc = e["tocou"]
+
+        if toc:
+            p = e["reagiu"] / toc
+            erro = 1.96 * np.sqrt(p * (1 - p) / toc)
+            taxa_r = f'{p * 100:.0f}% ±{erro * 100:.0f}'
+            taxa_q = f'{e["quebrou"] / toc * 100:.0f}%'
+        else:
+            taxa_r = taxa_q = "-"
+
+        linhas.append(
+            f'{g:<10}{e["niveis"]:>8}{toc:>9}{taxa_r:>20}{taxa_q:>11}'
+        )
+
+    return linhas
+
+
 def desenhar_smc(ax, smc, n, deslocamento, t):
     """Sobrepõe os conceitos SMC ao gráfico de preço."""
 
@@ -1847,7 +2653,8 @@ def desenhar_smc(ax, smc, n, deslocamento, t):
 # GRÁFICO
 # ============================================================
 
-def desenhar_grafico(figura, df_completo, linha, tema, periodo, smc=None):
+def desenhar_grafico(figura, df_completo, linha, tema, periodo, smc=None,
+                     sr=None):
 
     t = TEMAS[tema]
 
@@ -1967,6 +2774,13 @@ def desenhar_grafico(figura, df_completo, linha, tema, periodo, smc=None):
     if smc:
         desenhar_smc(ax_p, smc, n, len(df_completo) - n, t)
 
+    # Suportes/resistências não alteram a escala vertical do gráfico:
+    # só aparecem as zonas dentro da faixa de preço já visível.
+    if sr:
+        ylim_antes = ax_p.get_ylim()
+        desenhar_niveis(ax_p, sr, n, t, ylim_antes)
+        ax_p.set_ylim(ylim_antes)
+
     ax_p.set_xlim(-1, n + 9)
     ax_p.set_ylabel("Preço (R$)", color=t["fg"], fontsize=8)
 
@@ -2084,6 +2898,7 @@ COLUNAS = [
     "SC_INST", "SC_REV", "SC_CONF", "RSI", "ADX", "CMF", "MFI", "VOL_REL",
     "FR20", "RANK_FR", "DIST_EMA21",
     "ENTRADA", "STOP", "ALVO1", "ALVO2", "RISCO",
+    "SR_POS", "SR_S1", "SR_S1F", "SR_R1", "SR_R1F", "SR_ESP", "SR_RR",
     "SMC_CONF", "SMC_ESTRUT", "SMC_LIQ", "SMC_ZONA",
     "SMC_T1", "SMC_T2", "SMC_T3", "SMC_UP", "SMC_STOP", "SMC_RR",
     "FALTA"
@@ -2103,6 +2918,10 @@ TITULOS = {
     "SMC_LIQ": "SMC LIQUIDEZ", "SMC_ZONA": "SMC ZONA",
     "SMC_T1": "SMC ALVO 1", "SMC_T2": "SMC ALVO 2", "SMC_T3": "SMC ALVO 3",
     "SMC_UP": "SMC ALCANCE %", "SMC_STOP": "SMC STOP", "SMC_RR": "SMC R:R T1",
+    "SR_POS": "PREÇO vs S/R",
+    "SR_S1": "SUPORTE 1", "SR_S1F": "FORÇA S1",
+    "SR_R1": "RESISTÊNCIA 1", "SR_R1F": "FORÇA R1",
+    "SR_ESP": "ESPAÇO ATÉ R1 %", "SR_RR": "R:R S/R",
 }
 
 CASAS = {
@@ -2113,6 +2932,8 @@ CASAS = {
     "ALVO1": 2, "ALVO2": 2, "RISCO": 1,
     "SMC_T1": 2, "SMC_T2": 2, "SMC_T3": 2, "SMC_UP": 1,
     "SMC_STOP": 2, "SMC_RR": 1,
+    "SR_S1": 2, "SR_S1F": 0, "SR_R1": 2, "SR_R1F": 0,
+    "SR_ESP": 1, "SR_RR": 1,
 }
 
 
@@ -2143,6 +2964,7 @@ class ScannerB3:
         self.linhas = {}
         self.graficos = {}
         self.smc = {}
+        self.niveis = {}
         self.ativo_atual = None
         self.thread_ativa = False
         self.tema = "escuro"
@@ -2202,6 +3024,13 @@ class ScannerB3:
         ttk.Checkbutton(
             topo, text="SMC no gráfico",
             variable=self.mostrar_smc,
+            command=self.desenhar
+        ).pack(side="left", padx=(5, 5))
+
+        self.mostrar_sr = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            topo, text="Suportes/resistências no gráfico",
+            variable=self.mostrar_sr,
             command=self.desenhar
         ).pack(side="left", padx=(5, 20))
 
@@ -2274,11 +3103,21 @@ class ScannerB3:
         self.tabela.bind("<<TreeviewSelect>>", self.selecionar_ativo)
 
         # ---- Painel de leitura SMC (texto do ativo selecionado)
+        quadro_texto = ttk.Frame(quadro_grafico)
+        quadro_texto.pack(side="top", fill="x")
+
         self.texto_smc = tk.Text(
-            quadro_grafico, height=9, wrap="word", relief="flat",
+            quadro_texto, height=11, wrap="word", relief="flat",
             font=("Consolas", 9), padx=10, pady=6, state="disabled"
         )
-        self.texto_smc.pack(side="top", fill="x")
+
+        barra_texto = ttk.Scrollbar(
+            quadro_texto, orient="vertical", command=self.texto_smc.yview
+        )
+        self.texto_smc.configure(yscrollcommand=barra_texto.set)
+
+        barra_texto.pack(side="right", fill="y")
+        self.texto_smc.pack(side="left", fill="both", expand=True)
 
         # ---- Gráfico
         self.figura = Figure(figsize=(12, 6), dpi=100)
@@ -2457,7 +3296,9 @@ class ScannerB3:
 
                 elif tipo == "finalizado":
 
-                    _, tabela, graficos, erros, tempo, smc = mensagem
+                    (
+                        _, tabela, graficos, erros, tempo, smc, niveis
+                    ) = mensagem
 
                     self.resultados = tabela
                     self.linhas = tabela.set_index("ATIVO").assign(
@@ -2465,6 +3306,7 @@ class ScannerB3:
                     ).to_dict("index")
                     self.graficos = graficos
                     self.smc = smc
+                    self.niveis = niveis
 
                     self.exibir_resultados()
 
@@ -2593,21 +3435,35 @@ class ScannerB3:
 
     def atualizar_texto_smc(self):
 
-        if self.ativo_atual is None:
+        ativo = self.ativo_atual
+
+        if ativo is None:
             linhas = ["Selecione um ativo na tabela."]
-        elif self.ativo_atual in self.smc:
-            linhas = [f"SMC | {self.ativo_atual}"] + self.smc[
-                self.ativo_atual
-            ]["linhas"] + [
+        else:
+            sr = self.niveis.get(ativo)
+            smc = self.smc.get(ativo)
+
+            if sr:
+                linhas = [f"{ativo} | {sr['linhas'][0]}"] + sr["linhas"][1:]
+            else:
+                linhas = [
+                    f"{ativo} | suportes/resistências indisponíveis."
+                ]
+
+            linhas.append("")
+
+            if smc:
+                linhas += [f"SMC | {ativo}"] + smc["linhas"]
+            else:
+                linhas.append(
+                    "Alvos SMC: disponíveis apenas para ações com "
+                    "REVERSÃO CONFIRMADA."
+                )
+
+            linhas.append(
                 "Leitura em candles diários: níveis são zonas de reação "
                 "prováveis, não garantias, e não constituem recomendação."
-            ]
-        else:
-            linhas = [
-                f"SMC | {self.ativo_atual}",
-                "Análise SMC disponível apenas para ações com "
-                "REVERSÃO CONFIRMADA."
-            ]
+            )
 
         self.texto_smc.configure(state="normal")
         self.texto_smc.delete("1.0", "end")
@@ -2634,7 +3490,9 @@ class ScannerB3:
             self.linhas.get(self.ativo_atual),
             self.tema,
             int(self.periodo_var.get()),
-            self.smc.get(self.ativo_atual) if self.mostrar_smc.get() else None
+            self.smc.get(self.ativo_atual) if self.mostrar_smc.get() else None,
+            self.niveis.get(self.ativo_atual)
+            if self.mostrar_sr.get() else None
         )
 
         self.canvas.draw_idle()
